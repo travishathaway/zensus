@@ -1,0 +1,18 @@
+site_name: Zensus Collector
+site_description: A Python CLI program that collects Zensus data from Germany
+site_url: https://travishathaway.github.io/zensus
+repo_url: https://github.com/travishathaway/zensus
+repo_name: travishathaway/zensus
+
+theme:
+  name: material
+
+nav:
+  - Home: index.md
+
+plugins:
+  - search
+
+markdown_extensions:
+  - pymdownx.highlight
+  - pymdownx.superfences

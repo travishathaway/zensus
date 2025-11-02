@@ -1,0 +1,1 @@
+"""Zensus Collector test suite."""

@@ -1,0 +1,13 @@
+_commit: v1.6.0
+_src_path: gh:superlinear-ai/substrate
+author_email: travis.j.hathaway@gmail.com
+author_name: Travis Hathaway
+project_description: A Python CLI program that collects Zensus data from Germany
+project_name: Zensus Collector
+project_type: app
+project_url: https://github.com/travishathaway/zensus
+python_version: '3.13'
+typing: optional
+with_conventional_commits: true
+with_fastapi_api: false
+with_typer_cli: true
