@@ -9,7 +9,7 @@ A Python CLI program that collects Zensus data from Germany
 To install this package, run:
 
 ```sh
-pip install zensus-collector
+pip install git+ssh://git@github.com:/travishathaway/zensus-collector.git
 ```
 
 ## Using

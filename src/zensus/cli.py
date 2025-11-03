@@ -1,13 +1,94 @@
 """Zensus Collector CLI."""
 
+import csv
 from pathlib import Path
+from typing import Optional
 
 import httpx
+import psycopg
 import typer
 from rich import print as rprint
 from rich.progress import Progress, SpinnerColumn, DownloadColumn, TransferSpeedColumn
 
 app = typer.Typer()
+
+
+def sanitize_column_name(name: str) -> str:
+    """Sanitize column name to be PostgreSQL-compliant.
+
+    PostgreSQL identifiers cannot start with a digit.
+    This function prefixes such names with an underscore.
+    """
+    name = name.lower()
+    # If the name starts with a digit, prefix with underscore
+    if name and name[0].isdigit():
+        return f"_{name}"
+    return name
+
+
+def sanitize_table_name(filename: str) -> str:
+    """Sanitize table name to be PostgreSQL-compliant.
+
+    PostgreSQL table names have a 63-character limit.
+    This function removes redundant prefixes/suffixes and normalizes the name.
+    """
+    name = filename.lower().replace("-", "_").replace(" ", "_")
+
+    # Remove common redundant prefixes and suffixes
+    name = name.replace("zensus2022_", "")
+    name = name.replace("_gitter", "")
+
+    # Ensure it's not too long (PostgreSQL limit is 63 chars)
+    if len(name) > 63:
+        name = name[:63]
+
+    return name
+
+
+def detect_column_type(cursor, table_name: str, column_name: str) -> str:
+    """Detect the appropriate PostgreSQL type for a column.
+
+    Checks if column values can be converted to INTEGER or DOUBLE PRECISION.
+    Returns 'INTEGER', 'DOUBLE PRECISION', or 'TEXT'.
+    """
+    # Replace commas with dots for German decimal format
+    # Check if all non-null, non-empty values can be cast to numeric types
+    cursor.execute(
+        f"""
+        SELECT
+            COUNT(*) as total,
+            COUNT(CASE WHEN {column_name} IS NOT NULL AND {column_name} != '' THEN 1 END) as non_empty,
+            COUNT(CASE
+                WHEN {column_name} IS NOT NULL AND {column_name} != ''
+                AND REPLACE({column_name}, ',', '.') ~ '^-?[0-9]+$'
+                THEN 1
+            END) as integer_count,
+            COUNT(CASE
+                WHEN {column_name} IS NOT NULL AND {column_name} != ''
+                AND REPLACE({column_name}, ',', '.') ~ '^-?[0-9]+\.?[0-9]*$'
+                THEN 1
+            END) as numeric_count
+        FROM {table_name}
+        """
+    )
+    result = cursor.fetchone()
+    total, non_empty, integer_count, numeric_count = result
+
+    # If column is empty or has no non-empty values, keep as TEXT
+    if non_empty == 0:
+        return "TEXT"
+
+    # If all non-empty values are integers
+    if integer_count == non_empty:
+        return "INTEGER"
+
+    # If all non-empty values are numeric (including decimals)
+    if numeric_count == non_empty:
+        return "DOUBLE PRECISION"
+
+    # Otherwise, keep as TEXT
+    return "TEXT"
+
 
 # All gitterdaten files from the Zensus 2022 publication page
 GITTERDATEN_FILES = [
@@ -59,7 +140,7 @@ GITTERDATEN_FILES = [
 
 
 @app.command()
-def download_gitterdaten(
+def collect(
     output_dir: Path = typer.Option(
         Path("./data/gitterdaten"),
         "--output-dir",
@@ -124,6 +205,446 @@ def download_gitterdaten(
     rprint(f"  [green]✓ Downloaded: {downloaded}[/green]")
     rprint(f"  [yellow]⊘ Skipped: {skipped}[/yellow]")
     rprint(f"  [red]✗ Failed: {failed}[/red]")
+
+
+@app.command()
+def csv2pgsql(
+    data_dir: Path = typer.Option(
+        Path("/home/thath/volume/zensus/2022/data/"),
+        "--data-dir",
+        "-d",
+        help="Directory containing CSV files to import",
+    ),
+    host: str = typer.Option(
+        "localhost",
+        "--host",
+        "-h",
+        help="PostgreSQL host",
+    ),
+    port: int = typer.Option(
+        5432,
+        "--port",
+        "-p",
+        help="PostgreSQL port",
+    ),
+    database: str = typer.Option(
+        "zensus",
+        "--database",
+        "--db",
+        help="PostgreSQL database name",
+    ),
+    user: str = typer.Option(
+        "postgres",
+        "--user",
+        "-u",
+        help="PostgreSQL user",
+    ),
+    password: Optional[str] = typer.Option(
+        None,
+        "--password",
+        help="PostgreSQL password (will prompt if not provided)",
+        prompt=True,
+        hide_input=True,
+    ),
+    schema: str = typer.Option(
+        "zensus",
+        "--schema",
+        "-s",
+        help="PostgreSQL schema name",
+    ),
+    srid: int = typer.Option(
+        3035,
+        "--srid",
+        help="SRID for the coordinate system (default: 3035 for ETRS89-extended / LAEA Europe)",
+    ),
+    drop_existing: bool = typer.Option(
+        False,
+        "--drop-existing/--no-drop",
+        help="Drop existing tables before import",
+    ),
+) -> None:
+    """Import CSV files from Zensus data into PostgreSQL with PostGIS using fast COPY."""
+    if not data_dir.exists():
+        rprint(f"[red]Error: Data directory {data_dir} does not exist[/red]")
+        raise typer.Exit(1)
+
+    # Connect to PostgreSQL
+    try:
+        conn_str = f"host={host} port={port} dbname={database} user={user} password={password}"
+        conn = psycopg.connect(conn_str)
+        rprint(f"[green]✓ Connected to PostgreSQL database '{database}'[/green]")
+    except psycopg.Error as e:
+        rprint(f"[red]Error connecting to PostgreSQL: {e!s}[/red]")
+        raise typer.Exit(1)
+
+    try:
+        with conn.cursor() as cur:
+            # Enable PostGIS extension
+            cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
+            rprint("[green]✓ PostGIS extension enabled[/green]")
+
+            # Create schema if it doesn't exist
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema};")
+            rprint(f"[green]✓ Schema '{schema}' ready[/green]")
+            conn.commit()
+
+        # Find all CSV files in subdirectories
+        csv_files = list(data_dir.rglob("*.csv"))
+        rprint(f"\n[cyan]Found {len(csv_files)} CSV files to import[/cyan]\n")
+
+        imported_count = 0
+        skipped_count = 0
+        failed_count = 0
+
+        for csv_file in csv_files:
+            try:
+                # Generate table name from file name
+                table_name = sanitize_table_name(csv_file.stem)
+                full_table_name = f"{schema}.{table_name}"
+                temp_table_name = f"{schema}.{table_name}_temp"
+
+                rprint(f"[cyan]Processing: {csv_file.name}[/cyan]")
+                rprint(f"  [cyan]Table name: {full_table_name} ({len(table_name)} chars)[/cyan]")
+
+                # Read CSV header to determine columns
+                with open(csv_file, encoding="utf-8") as f:
+                    reader = csv.reader(f, delimiter=";")
+                    headers = [h.strip() for h in next(reader)]  # Strip whitespace
+
+                # Create mapping of original headers to sanitized column names
+                column_mapping = {header: sanitize_column_name(header) for header in headers}
+
+                # Report any renamed columns
+                renamed_cols = [
+                    (orig, san) for orig, san in column_mapping.items() if orig.lower() != san
+                ]
+                if renamed_cols:
+                    rprint(f"  [yellow]Renamed {len(renamed_cols)} columns:[/yellow]")
+                    for orig, san in renamed_cols[:5]:  # Show first 5
+                        rprint(f"    {orig} → {san}")
+                    if len(renamed_cols) > 5:
+                        rprint(f"    ... and {len(renamed_cols) - 5} more")
+
+                # Identify coordinate columns (using sanitized names)
+                x_col = None
+                y_col = None
+                for header in headers:
+                    sanitized = column_mapping[header]
+                    # Check for x coordinate column (starts with x_mp or is exactly named with coordinate pattern)
+                    if (
+                        sanitized.startswith("x_mp")
+                        or sanitized.startswith("_x_mp")
+                        or "_x_mp_" in sanitized
+                    ):
+                        x_col = sanitized
+                    # Check for y coordinate column (starts with y_mp or is exactly named with coordinate pattern)
+                    elif (
+                        sanitized.startswith("y_mp")
+                        or sanitized.startswith("_y_mp")
+                        or "_y_mp_" in sanitized
+                    ):
+                        y_col = sanitized
+
+                # Debug output for coordinate detection
+                if x_col and y_col:
+                    rprint(f"  [green]Detected coordinates: {x_col}, {y_col}[/green]")
+                else:
+                    rprint(
+                        f"  [yellow]No coordinate columns detected "
+                        f"(x_col={x_col}, y_col={y_col})[/yellow]"
+                    )
+                    rprint(f"  [yellow]Available columns: {', '.join(column_mapping.values())}[/yellow]")
+
+                with conn.cursor() as cur:
+                    # Always drop temp table if it exists
+                    cur.execute(f"DROP TABLE IF EXISTS {temp_table_name} CASCADE;")
+
+                    # Check if final table exists and if it should be recreated
+                    cur.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables
+                            WHERE table_schema = %s AND table_name = %s
+                        )
+                        """,
+                        (schema, table_name),
+                    )
+                    table_exists = cur.fetchone()[0]
+
+                    if table_exists:
+                        if drop_existing:
+                            cur.execute(f"DROP TABLE {full_table_name} CASCADE;")
+                            rprint(f"  [yellow]Dropped existing table[/yellow]")
+                        else:
+                            rprint(f"  [yellow]Table already exists, skipping. Use --drop-existing to recreate.[/yellow]")
+                            skipped_count += 1
+                            continue
+
+                    # Create temporary table with all columns as TEXT (sanitized names)
+                    temp_columns_def = [f"{column_mapping[h]} TEXT" for h in headers]
+                    create_temp_sql = (
+                        f"CREATE TABLE {temp_table_name} "
+                        f"({', '.join(temp_columns_def)});"
+                    )
+                    cur.execute(create_temp_sql)
+
+                    # Use COPY to bulk load CSV into temporary table
+                    with open(csv_file, encoding="utf-8") as f:
+                        # Skip header row
+                        next(f)
+
+                        # Use psycopg3 copy API
+                        copy_sql = f"""
+                            COPY {temp_table_name}
+                            FROM STDIN
+                            WITH (FORMAT CSV, DELIMITER ';', NULL '–', ENCODING 'UTF8')
+                        """
+                        with cur.copy(copy_sql) as copy:
+                            while True:
+                                data = f.read(8192)
+                                if not data:
+                                    break
+                                copy.write(data)
+
+                    # Get row count from temp table
+                    cur.execute(f"SELECT COUNT(*) FROM {temp_table_name};")
+                    rows_loaded = cur.fetchone()[0]
+
+                    # Detect data types for columns
+                    rprint("  [cyan]Detecting column types...[/cyan]")
+                    column_types = {}
+                    for header in headers:
+                        col_name = column_mapping[header]
+                        # Skip coordinate columns if we're creating geometry
+                        if x_col and y_col and col_name in [x_col, y_col]:
+                            continue
+                        # Detect type for this column
+                        detected_type = detect_column_type(cur, temp_table_name, col_name)
+                        column_types[col_name] = detected_type
+
+                    # Report detected types
+                    numeric_cols = {
+                        col: typ for col, typ in column_types.items() if typ != "TEXT"
+                    }
+                    if numeric_cols:
+                        rprint(
+                            f"  [green]Detected {len(numeric_cols)} numeric columns "
+                            f"({sum(1 for t in numeric_cols.values() if t == 'INTEGER')} INTEGER, "
+                            f"{sum(1 for t in numeric_cols.values() if t == 'DOUBLE PRECISION')} DOUBLE PRECISION)[/green]"
+                        )
+
+                    # Create final table with detected types (using sanitized names)
+                    final_columns_def = []
+                    for header in headers:
+                        col_name = column_mapping[header]
+                        # Skip coordinate columns if we're creating geometry
+                        if x_col and y_col and col_name in [x_col, y_col]:
+                            continue
+                        col_type = column_types.get(col_name, "TEXT")
+                        final_columns_def.append(f"{col_name} {col_type}")
+
+                    # Add geometry column if we have coordinates
+                    if x_col and y_col:
+                        final_columns_def.append(f"geom GEOMETRY(Point, {srid})")
+
+                    # Create the final table (we already checked if it exists above)
+                    create_final_sql = (
+                        f"CREATE TABLE {full_table_name} "
+                        f"({', '.join(final_columns_def)});"
+                    )
+                    cur.execute(create_final_sql)
+
+                    # Prepare column lists for INSERT INTO ... SELECT (using sanitized names)
+                    select_cols = []
+                    insert_cols = []
+
+                    for header in headers:
+                        col_name = column_mapping[header]
+                        # Skip coordinate columns if we're creating geometry
+                        if x_col and y_col and col_name in [x_col, y_col]:
+                            continue
+
+                        col_type = column_types.get(col_name, "TEXT")
+
+                        # Build the SELECT expression based on the target type
+                        if col_type == "INTEGER":
+                            # Convert TEXT to INTEGER, handling German decimal format and NULLs
+                            select_expr = (
+                                f"NULLIF(REPLACE({col_name}, ',', '.'), '')::INTEGER"
+                            )
+                        elif col_type == "DOUBLE PRECISION":
+                            # Convert TEXT to DOUBLE PRECISION, handling German decimal format and NULLs
+                            select_expr = (
+                                f"NULLIF(REPLACE({col_name}, ',', '.'), '')::DOUBLE PRECISION"
+                            )
+                        else:
+                            # Keep as TEXT
+                            select_expr = col_name
+
+                        select_cols.append(select_expr)
+                        insert_cols.append(col_name)
+
+                    # Add geometry transformation if we have coordinates
+                    if x_col and y_col:
+                        # Use ST_SetSRID and ST_MakePoint for geometry creation
+                        select_cols.append(
+                            f"ST_SetSRID(ST_MakePoint("
+                            f"NULLIF(REPLACE({x_col}, ',', '.'), '')::double precision, "
+                            f"NULLIF(REPLACE({y_col}, ',', '.'), '')::double precision"
+                            f"), {srid})"
+                        )
+                        insert_cols.append("geom")
+
+                    # Insert from temp to final table with geometry transformation
+                    insert_from_temp_sql = f"""
+                        INSERT INTO {full_table_name} ({', '.join(insert_cols)})
+                        SELECT {', '.join(select_cols)}
+                        FROM {temp_table_name}
+                    """
+                    cur.execute(insert_from_temp_sql)
+
+                    # Create spatial index if we have geometry
+                    if x_col and y_col:
+                        index_name = f"{table_name}_geom_idx"
+                        cur.execute(
+                            f"CREATE INDEX IF NOT EXISTS {index_name} "
+                            f"ON {full_table_name} USING GIST (geom);"
+                        )
+
+                    # Drop temporary table
+                    cur.execute(f"DROP TABLE {temp_table_name};")
+
+                    conn.commit()
+                    rprint(
+                        f"  [green]✓ Imported {rows_loaded:,} rows to {full_table_name}"
+                        f"{' (with geometry)' if x_col and y_col else ''}[/green]"
+                    )
+                    imported_count += 1
+
+            except Exception as e:
+                rprint(f"  [red]✗ Failed to import {csv_file.name}: {e!s}[/red]")
+                failed_count += 1
+                conn.rollback()
+                continue
+
+        rprint("\n[bold cyan]Import Summary:[/bold cyan]")
+        rprint(f"  [green]✓ Imported: {imported_count}[/green]")
+        rprint(f"  [yellow]⊘ Skipped: {skipped_count}[/yellow]")
+        rprint(f"  [red]✗ Failed: {failed_count}[/red]")
+
+    finally:
+        conn.close()
+        rprint("\n[cyan]Database connection closed[/cyan]")
+
+
+@app.command()
+def drop_schema_tables(
+    host: str = typer.Option(
+        "localhost",
+        "--host",
+        "-h",
+        help="PostgreSQL host",
+    ),
+    port: int = typer.Option(
+        5432,
+        "--port",
+        "-p",
+        help="PostgreSQL port",
+    ),
+    database: str = typer.Option(
+        "zensus",
+        "--database",
+        "--db",
+        help="PostgreSQL database name",
+    ),
+    user: str = typer.Option(
+        "postgres",
+        "--user",
+        "-u",
+        help="PostgreSQL user",
+    ),
+    password: Optional[str] = typer.Option(
+        None,
+        "--password",
+        help="PostgreSQL password (will prompt if not provided)",
+        prompt=True,
+        hide_input=True,
+    ),
+    schema: str = typer.Option(
+        "zensus",
+        "--schema",
+        "-s",
+        help="PostgreSQL schema name",
+    ),
+    confirm: bool = typer.Option(
+        False,
+        "--confirm",
+        "-y",
+        help="Skip confirmation prompt",
+    ),
+) -> None:
+    """Drop all tables in a PostgreSQL schema."""
+    # Connect to PostgreSQL
+    try:
+        conn_str = f"host={host} port={port} dbname={database} user={user} password={password}"
+        conn = psycopg.connect(conn_str)
+        rprint(f"[green]✓ Connected to PostgreSQL database '{database}'[/green]")
+    except psycopg.Error as e:
+        rprint(f"[red]Error connecting to PostgreSQL: {e!s}[/red]")
+        raise typer.Exit(1)
+
+    try:
+        with conn.cursor() as cur:
+            # Get all tables in the schema
+            cur.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = %s
+                AND table_type = 'BASE TABLE'
+                ORDER BY table_name
+                """,
+                (schema,),
+            )
+            tables = [row[0] for row in cur.fetchall()]
+
+            if not tables:
+                rprint(f"[yellow]No tables found in schema '{schema}'[/yellow]")
+                raise typer.Exit(0)
+
+            rprint(f"\n[cyan]Found {len(tables)} tables in schema '{schema}':[/cyan]")
+            for table in tables[:10]:  # Show first 10
+                rprint(f"  • {table}")
+            if len(tables) > 10:
+                rprint(f"  ... and {len(tables) - 10} more")
+
+            # Confirm deletion
+            if not confirm:
+                rprint(
+                    f"\n[bold red]Warning: This will drop all {len(tables)} tables "
+                    f"in schema '{schema}'![/bold red]"
+                )
+                confirmed = typer.confirm("Are you sure you want to continue?")
+                if not confirmed:
+                    rprint("[yellow]Aborted[/yellow]")
+                    raise typer.Exit(0)
+
+            # Drop all tables
+            rprint(f"\n[cyan]Dropping {len(tables)} tables...[/cyan]")
+            for table in tables:
+                full_table_name = f"{schema}.{table}"
+                cur.execute(f"DROP TABLE IF EXISTS {full_table_name} CASCADE;")
+                rprint(f"  [green]✓ Dropped {full_table_name}[/green]")
+
+            conn.commit()
+            rprint(f"\n[bold green]Successfully dropped all tables in schema '{schema}'[/bold green]")
+
+    except Exception as e:
+        rprint(f"[red]Error: {e!s}[/red]")
+        conn.rollback()
+        raise typer.Exit(1)
+    finally:
+        conn.close()
 
 
 @app.command()
