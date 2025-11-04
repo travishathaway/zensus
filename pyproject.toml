@@ -3,31 +3,34 @@ requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
 [project]  # https://packaging.python.org/en/latest/specifications/pyproject-toml/
-name = "zensus"
+name = "zensus2pgsql"
 version = "0.0.0"
-description = "A Python CLI program that collects Zensus data from Germany"
+description = "A Python CLI program that collects Zensus GIS data from Germany and imports it into PostgreSQL"
 readme = "README.md"
 authors = [
   { name = "Travis Hathaway", email = "travis.j.hathaway@gmail.com" },
 ]
 requires-python = ">=3.13,<4.0"
 dependencies = [
+  "aiofiles>=25.1.0",
   "httpx (>=0.28.1)",
+  "platformdirs>=4.5.0",
   "poethepoet (>=0.32.1)",
   "psycopg[binary] (>=3.2.0)",
+  "rich>=14.2.0",
   "typer (>=0.15.1)",
 ]
 
 [project.scripts]  # https://docs.astral.sh/uv/concepts/projects/config/#command-line-interfaces
-zensus = "zensus.cli:app"
+zensus2pgsql = "zensus2pgsql.cli:app"
 
 [project.urls]  # https://packaging.python.org/en/latest/specifications/well-known-project-urls/#well-known-labels
-homepage = "https://github.com/travishathaway/zensus"
-source = "https://github.com/travishathaway/zensus"
-changelog = "https://github.com/travishathaway/zensus/blob/main/CHANGELOG.md"
-releasenotes = "https://github.com/travishathaway/zensus/releases"
-documentation = "https://travishathaway.github.io/zensus"
-issues = "https://github.com/travishathaway/zensus/issues"
+homepage = "https://github.com/travishathaway/zensus2pgsql"
+source = "https://github.com/travishathaway/zensus2pgsql"
+changelog = "https://github.com/travishathaway/zensus2pgsql/blob/main/CHANGELOG.md"
+releasenotes = "https://github.com/travishathaway/zensus2pgsql/releases"
+documentation = "https://travishathaway.github.io/zensus2pgsql"
+issues = "https://github.com/travishathaway/zensus2pgsql/issues"
 
 [dependency-groups]  # https://docs.astral.sh/uv/concepts/projects/dependencies/#development-dependencies
 dev = [

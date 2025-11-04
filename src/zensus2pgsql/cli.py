@@ -10,8 +10,10 @@ import typer
 from rich import print as rprint
 from rich.progress import Progress, SpinnerColumn, DownloadColumn, TransferSpeedColumn
 
-app = typer.Typer()
+from .commands.create import app as create_app
 
+app = typer.Typer(help="Zensus Collector CLI")
+app.add_typer(create_app, name="c")
 
 def sanitize_column_name(name: str) -> str:
     """Sanitize column name to be PostgreSQL-compliant.
@@ -43,6 +45,27 @@ def sanitize_table_name(filename: str) -> str:
         name = name[:63]
 
     return name
+
+
+def detect_file_encoding(file_path: Path) -> str:
+    """Detect the encoding of a CSV file.
+
+    Tries common encodings and returns the first one that works.
+    """
+    encodings = ["utf-8", "iso-8859-1", "windows-1252", "cp1252"]
+
+    for encoding in encodings:
+        try:
+            with open(file_path, encoding=encoding) as f:
+                # Try to read first 10 lines
+                for _ in range(10):
+                    f.readline()
+            return encoding
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+
+    # Default to iso-8859-1 which accepts all byte values
+    return "iso-8859-1"
 
 
 def detect_column_type(cursor, table_name: str, column_name: str) -> str:
@@ -306,8 +329,13 @@ def csv2pgsql(
                 rprint(f"[cyan]Processing: {csv_file.name}[/cyan]")
                 rprint(f"  [cyan]Table name: {full_table_name} ({len(table_name)} chars)[/cyan]")
 
+                # Detect file encoding
+                file_encoding = detect_file_encoding(csv_file)
+                if file_encoding != "utf-8":
+                    rprint(f"  [yellow]Detected non-UTF-8 encoding: {file_encoding}[/yellow]")
+
                 # Read CSV header to determine columns
-                with open(csv_file, encoding="utf-8") as f:
+                with open(csv_file, encoding=file_encoding) as f:
                     reader = csv.reader(f, delimiter=";")
                     headers = [h.strip() for h in next(reader)]  # Strip whitespace
 
@@ -389,15 +417,24 @@ def csv2pgsql(
                     cur.execute(create_temp_sql)
 
                     # Use COPY to bulk load CSV into temporary table
-                    with open(csv_file, encoding="utf-8") as f:
+                    with open(csv_file, encoding=file_encoding) as f:
                         # Skip header row
                         next(f)
+
+                        # Map Python encoding to PostgreSQL encoding name
+                        pg_encoding_map = {
+                            "utf-8": "UTF8",
+                            "iso-8859-1": "LATIN1",
+                            "windows-1252": "WIN1252",
+                            "cp1252": "WIN1252",
+                        }
+                        pg_encoding = pg_encoding_map.get(file_encoding, "UTF8")
 
                         # Use psycopg3 copy API
                         copy_sql = f"""
                             COPY {temp_table_name}
                             FROM STDIN
-                            WITH (FORMAT CSV, DELIMITER ';', NULL '–', ENCODING 'UTF8')
+                            WITH (FORMAT CSV, DELIMITER ';', NULL '–', ENCODING '{pg_encoding}')
                         """
                         with cur.copy(copy_sql) as copy:
                             while True:
@@ -535,118 +572,3 @@ def csv2pgsql(
     finally:
         conn.close()
         rprint("\n[cyan]Database connection closed[/cyan]")
-
-
-@app.command()
-def drop_schema_tables(
-    host: str = typer.Option(
-        "localhost",
-        "--host",
-        "-h",
-        help="PostgreSQL host",
-    ),
-    port: int = typer.Option(
-        5432,
-        "--port",
-        "-p",
-        help="PostgreSQL port",
-    ),
-    database: str = typer.Option(
-        "zensus",
-        "--database",
-        "--db",
-        help="PostgreSQL database name",
-    ),
-    user: str = typer.Option(
-        "postgres",
-        "--user",
-        "-u",
-        help="PostgreSQL user",
-    ),
-    password: Optional[str] = typer.Option(
-        None,
-        "--password",
-        help="PostgreSQL password (will prompt if not provided)",
-        prompt=True,
-        hide_input=True,
-    ),
-    schema: str = typer.Option(
-        "zensus",
-        "--schema",
-        "-s",
-        help="PostgreSQL schema name",
-    ),
-    confirm: bool = typer.Option(
-        False,
-        "--confirm",
-        "-y",
-        help="Skip confirmation prompt",
-    ),
-) -> None:
-    """Drop all tables in a PostgreSQL schema."""
-    # Connect to PostgreSQL
-    try:
-        conn_str = f"host={host} port={port} dbname={database} user={user} password={password}"
-        conn = psycopg.connect(conn_str)
-        rprint(f"[green]✓ Connected to PostgreSQL database '{database}'[/green]")
-    except psycopg.Error as e:
-        rprint(f"[red]Error connecting to PostgreSQL: {e!s}[/red]")
-        raise typer.Exit(1)
-
-    try:
-        with conn.cursor() as cur:
-            # Get all tables in the schema
-            cur.execute(
-                """
-                SELECT table_name
-                FROM information_schema.tables
-                WHERE table_schema = %s
-                AND table_type = 'BASE TABLE'
-                ORDER BY table_name
-                """,
-                (schema,),
-            )
-            tables = [row[0] for row in cur.fetchall()]
-
-            if not tables:
-                rprint(f"[yellow]No tables found in schema '{schema}'[/yellow]")
-                raise typer.Exit(0)
-
-            rprint(f"\n[cyan]Found {len(tables)} tables in schema '{schema}':[/cyan]")
-            for table in tables[:10]:  # Show first 10
-                rprint(f"  • {table}")
-            if len(tables) > 10:
-                rprint(f"  ... and {len(tables) - 10} more")
-
-            # Confirm deletion
-            if not confirm:
-                rprint(
-                    f"\n[bold red]Warning: This will drop all {len(tables)} tables "
-                    f"in schema '{schema}'![/bold red]"
-                )
-                confirmed = typer.confirm("Are you sure you want to continue?")
-                if not confirmed:
-                    rprint("[yellow]Aborted[/yellow]")
-                    raise typer.Exit(0)
-
-            # Drop all tables
-            rprint(f"\n[cyan]Dropping {len(tables)} tables...[/cyan]")
-            for table in tables:
-                full_table_name = f"{schema}.{table}"
-                cur.execute(f"DROP TABLE IF EXISTS {full_table_name} CASCADE;")
-                rprint(f"  [green]✓ Dropped {full_table_name}[/green]")
-
-            conn.commit()
-            rprint(f"\n[bold green]Successfully dropped all tables in schema '{schema}'[/bold green]")
-
-    except Exception as e:
-        rprint(f"[red]Error: {e!s}[/red]")
-        conn.rollback()
-        raise typer.Exit(1)
-    finally:
-        conn.close()
-
-
-@app.command()
-def main(name: str = "Chell") -> None:
-    """Fire portal gun."""

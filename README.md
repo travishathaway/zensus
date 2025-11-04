@@ -1,15 +1,15 @@
-[![Open in Dev Containers](https://img.shields.io/static/v1?label=Dev%20Containers&message=Open&color=blue&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTE3IDE2VjdsLTYgNU0yIDlWOGwxLTFoMWw0IDMgOC04aDFsNCAyIDEgMXYxNGwtMSAxLTQgMmgtMWwtOC04LTQgM0gzbC0xLTF2LTFsMy0zIi8+PC9zdmc+)](https://vscode.dev/redirect?url=vscode://ms-vscode-remote.remote-containers/cloneInVolume?url=https://github.com/travishathaway/zensus) [![Open in GitHub Codespaces](https://img.shields.io/static/v1?label=GitHub%20Codespaces&message=Open&color=blue&logo=github)](https://github.com/codespaces/new/travishathaway/zensus) [![Documentation](https://img.shields.io/static/v1?label=Documentation&message=View&color=blue&logo=readme&logoColor=white)](https://travishathaway.github.io/zensus)
+[![Open in Dev Containers](https://img.shields.io/static/v1?label=Dev%20Containers&message=Open&color=blue&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTE3IDE2VjdsLTYgNU0yIDlWOGwxLTFoMWw0IDMgOC04aDFsNCAyIDEgMXYxNGwtMSAxLTQgMmgtMWwtOC04LTQgM0gzbC0xLTF2LTFsMy0zIi8+PC9zdmc+)](https://vscode.dev/redirect?url=vscode://ms-vscode-remote.remote-containers/cloneInVolume?url=https://github.com/travishathaway/zensus2pgsql) [![Open in GitHub Codespaces](https://img.shields.io/static/v1?label=GitHub%20Codespaces&message=Open&color=blue&logo=github)](https://github.com/codespaces/new/travishathaway/zensus2pgsql) [![Documentation](https://img.shields.io/static/v1?label=Documentation&message=View&color=blue&logo=readme&logoColor=white)](https://travishathaway.github.io/zensus2pgsql)
 
-# Zensus Collector
+# zensus2pgsql
 
-A Python CLI program that collects Zensus data from Germany
+A Python CLI program that imports Zensus CSV data into PostgreSQL with PostGIS
 
 ## Installing
 
 To install this package, run:
 
 ```sh
-pip install git+ssh://git@github.com:/travishathaway/zensus-collector.git
+pip install git+ssh://git@github.com:/travishathaway/zensus2pgsql.git
 ```
 
 ## Using
@@ -17,7 +17,7 @@ pip install git+ssh://git@github.com:/travishathaway/zensus-collector.git
 To view the CLI help information, run:
 
 ```sh
-zensus-collector --help
+zensus2pgsql --help
 ```
 
 ## Contributing
@@ -50,8 +50,8 @@ zensus-collector --help
 
 The following development environments are supported:
 
-1. ⭐️ _GitHub Codespaces_: click on [Open in GitHub Codespaces](https://github.com/codespaces/new/travishathaway/zensus) to start developing in your browser.
-1. ⭐️ _VS Code Dev Container (with container volume)_: click on [Open in Dev Containers](https://vscode.dev/redirect?url=vscode://ms-vscode-remote.remote-containers/cloneInVolume?url=https://github.com/travishathaway/zensus) to clone this repository in a container volume and create a Dev Container with VS Code.
+1. ⭐️ _GitHub Codespaces_: click on [Open in GitHub Codespaces](https://github.com/codespaces/new/travishathaway/zensus2pgsql) to start developing in your browser.
+1. ⭐️ _VS Code Dev Container (with container volume)_: click on [Open in Dev Containers](https://vscode.dev/redirect?url=vscode://ms-vscode-remote.remote-containers/cloneInVolume?url=https://github.com/travishathaway/zensus2pgsql) to clone this repository in a container volume and create a Dev Container with VS Code.
 1. ⭐️ _uv_: clone this repository and run the following from root of the repository:
 
     ```sh
