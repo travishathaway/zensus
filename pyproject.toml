@@ -20,6 +20,7 @@ dependencies = [
   "psycopg[binary] (>=3.2.0)",
   "rich>=14.2.0",
   "typer (>=0.15.1)",
+  "types-aiofiles>=25.1.0.20251011",
 ]
 
 [project.scripts]  # https://docs.astral.sh/uv/concepts/projects/config/#command-line-interfaces

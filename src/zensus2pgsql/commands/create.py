@@ -5,8 +5,10 @@ import csv
 import tempfile
 import zipfile
 from pathlib import Path
+from typing import NamedTuple
 
 import aiofiles
+import asyncpg
 import httpx
 import psycopg
 import typer
@@ -294,9 +296,42 @@ GITTERDATEN_FILES = [
 ]
 
 
+class DatabaseConfig(NamedTuple):
+    """Hold database configuration."""
+
+    host: str
+    port: int
+    database: str
+    user: str
+    password: str | None
+    schema: str
+    srid: int
+    drop_existing: bool
+
+
 @app.command()
 def collect(
     tables: list[str] = typer.Argument(["all"]),
+    host: str = typer.Option("localhost", "--host", "-h", help="PostgreSQL host"),
+    port: int = typer.Option(5432, "--port", "-p", help="PostgreSQL port"),
+    database: str = typer.Option("zensus", "--database", "--db", help="PostgreSQL database name"),
+    user: str = typer.Option("postgres", "--user", "-u", help="PostgreSQL user"),
+    password: str | None = typer.Option(
+        None,
+        "--password",
+        help="PostgreSQL password (will prompt if not provided)",
+        prompt=True,
+        hide_input=True,
+    ),
+    schema: str = typer.Option("zensus", "--schema", "-s", help="PostgreSQL schema name"),
+    srid: int = typer.Option(
+        3035,
+        "--srid",
+        help="SRID for the coordinate system (default: 3035 for ETRS89-extended / LAEA Europe)",
+    ),
+    drop_existing: bool = typer.Option(
+        False, "--drop-existing/--no-drop", help="Drop existing tables before import"
+    ),
     skip_existing: bool = typer.Option(
         True, "--skip-existing/--overwrite", help="Skip files that already exist"
     ),
@@ -305,14 +340,28 @@ def collect(
     # Mak sure our cache directory exists
     create_cache_dir()
 
+    db_config = DatabaseConfig(host, port, database, user, password, schema, srid, drop_existing)
+
     # Create output directory if it doesn't exist
-    asyncio.run(collect_wrapper(tables, skip_existing))
+    asyncio.run(collect_wrapper(tables, skip_existing, db_config))
 
 
-async def collect_wrapper(tables, skip_existing):
+async def collect_wrapper(tables: list[str], skip_existing: bool, db_config: DatabaseConfig):
     """
     Encapsulate all async opertations for the collect command
     """
+    # Test database connection
+    try:
+        conn_str = (
+            f"host={db_config.host} port={db_config.port} "
+            f"dbname={db_config.database} user={db_config.user} password={db_config.password}"
+        )
+        db_conn = await asyncpg.connect(conn_str)
+        # rprint(f"[green]✓ Connected to PostgreSQL database '{db_config.database}'[/green]")
+    except psycopg.Error as e:
+        rprint(f"[red]Error connecting to PostgreSQL: {e!s}[/red]")
+        raise typer.Exit(1)
+
     files_to_import = tuple(
         (
             (filename, url)
@@ -333,6 +382,8 @@ async def collect_wrapper(tables, skip_existing):
                 http_client,
                 Path(CACHE),
                 progress,
+                db_conn,
+                db_config,
                 total=len(files_to_import),
                 skip_existing=skip_existing,
             )
@@ -379,6 +430,8 @@ class FetchManager:
         client: httpx.AsyncClient,
         output_folder: Path,
         progress: Progress,
+        db_conn: asyncpg.Connection,
+        db_config: DatabaseConfig,
         total: int | None = None,
         semaphore: int = 10,
         skip_existing: bool = True,
@@ -387,6 +440,8 @@ class FetchManager:
         self.output_folder = output_folder
         self.semaphore = asyncio.Semaphore(semaphore)
         self.progress = progress
+        self.db_conn = db_conn
+        self.db_config = db_config
         self.skip_existing = skip_existing
 
         # Progress bar tasks
@@ -488,7 +543,250 @@ class FetchManager:
             try:
                 self.progress.update(self.database_task, advance=1)
 
-                # ... do database stuff
+                # Generate table name from file name
+                table_name = sanitize_table_name(csv_file.stem)
+                full_table_name = f"{schema}.{table_name}"
+                temp_table_name = f"{schema}.{table_name}_temp"
+
+                rprint(f"[cyan]Processing: {csv_file.name}[/cyan]")
+                rprint(f"  [cyan]Table name: {full_table_name} ({len(table_name)} chars)[/cyan]")
+
+                # Detect file encoding
+                file_encoding = detect_file_encoding(csv_file)
+                if file_encoding != "utf-8":
+                    rprint(f"  [yellow]Detected non-UTF-8 encoding: {file_encoding}[/yellow]")
+
+                # Read CSV header to determine columns
+                with open(csv_file, encoding=file_encoding) as f:
+                    reader = csv.reader(f, delimiter=";")
+                    headers = [h.strip() for h in next(reader)]  # Strip whitespace
+
+                # Create mapping of original headers to sanitized column names
+                column_mapping = {header: sanitize_column_name(header) for header in headers}
+
+                # Report any renamed columns
+                renamed_cols = [
+                    (orig, san) for orig, san in column_mapping.items() if orig.lower() != san
+                ]
+                if renamed_cols:
+                    rprint(f"  [yellow]Renamed {len(renamed_cols)} columns:[/yellow]")
+                    for orig, san in renamed_cols[:5]:  # Show first 5
+                        rprint(f"    {orig} → {san}")
+                    if len(renamed_cols) > 5:
+                        rprint(f"    ... and {len(renamed_cols) - 5} more")
+
+                # Identify coordinate columns (using sanitized names)
+                x_col = None
+                y_col = None
+                for header in headers:
+                    sanitized = column_mapping[header]
+                    # Check for x coordinate column (starts with x_mp or is exactly named with coordinate pattern)
+                    if (
+                        sanitized.startswith("x_mp")
+                        or sanitized.startswith("_x_mp")
+                        or "_x_mp_" in sanitized
+                    ):
+                        x_col = sanitized
+                    # Check for y coordinate column (starts with y_mp or is exactly named with coordinate pattern)
+                    elif (
+                        sanitized.startswith("y_mp")
+                        or sanitized.startswith("_y_mp")
+                        or "_y_mp_" in sanitized
+                    ):
+                        y_col = sanitized
+
+                # Debug output for coordinate detection
+                if x_col and y_col:
+                    rprint(f"  [green]Detected coordinates: {x_col}, {y_col}[/green]")
+                else:
+                    rprint(
+                        f"  [yellow]No coordinate columns detected "
+                        f"(x_col={x_col}, y_col={y_col})[/yellow]"
+                    )
+                    rprint(
+                        f"  [yellow]Available columns: {', '.join(column_mapping.values())}[/yellow]"
+                    )
+
+                with conn.cursor() as cur:
+                    # Always drop temp table if it exists
+                    cur.execute(f"DROP TABLE IF EXISTS {temp_table_name} CASCADE;")
+
+                    # Check if final table exists and if it should be recreated
+                    cur.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables
+                            WHERE table_schema = %s AND table_name = %s
+                        )
+                        """,
+                        (schema, table_name),
+                    )
+                    row = cur.fetchone()
+
+                    table_exists = row[0] if row is not None else False
+
+                    if table_exists:
+                        if drop_existing:
+                            cur.execute(f"DROP TABLE {full_table_name} CASCADE;")
+                            rprint("  [yellow]Dropped existing table[/yellow]")
+                        else:
+                            rprint(
+                                "  [yellow]Table already exists, skipping. Use --drop-existing to recreate.[/yellow]"
+                            )
+                            skipped_count += 1
+                            continue
+
+                    # Create temporary table with all columns as TEXT (sanitized names)
+                    temp_columns_def = [f"{column_mapping[h]} TEXT" for h in headers]
+                    create_temp_sql = (
+                        f"CREATE TABLE {temp_table_name} ({', '.join(temp_columns_def)});"
+                    )
+                    cur.execute(create_temp_sql)
+
+                    # Use COPY to bulk load CSV into temporary table
+                    with open(csv_file, encoding=file_encoding) as f:
+                        # Skip header row
+                        next(f)
+
+                        # Map Python encoding to PostgreSQL encoding name
+                        pg_encoding_map = {
+                            "utf-8": "UTF8",
+                            "iso-8859-1": "LATIN1",
+                            "windows-1252": "WIN1252",
+                            "cp1252": "WIN1252",
+                        }
+                        pg_encoding = pg_encoding_map.get(file_encoding, "UTF8")
+
+                        # Use psycopg3 copy API
+                        copy_sql = f"""
+                            COPY {temp_table_name}
+                            FROM STDIN
+                            WITH (FORMAT CSV, DELIMITER ';', NULL '–', ENCODING '{pg_encoding}')
+                        """
+                        with cur.copy(copy_sql) as copy:
+                            while True:
+                                data = f.read(8192)
+                                if not data:
+                                    break
+                                copy.write(data)
+
+                    # Get row count from temp table
+                    cur.execute(f"SELECT COUNT(*) FROM {temp_table_name};")
+                    row = cur.fetchone()
+                    rows_loaded = row[0] if row is not None else 0
+
+                    # Detect data types for columns
+                    rprint("  [cyan]Detecting column types...[/cyan]")
+                    column_types = {}
+                    for header in headers:
+                        col_name = column_mapping[header]
+                        # Skip coordinate columns if we're creating geometry
+                        if x_col and y_col and col_name in [x_col, y_col]:
+                            continue
+                        # Detect type for this column
+                        detected_type = detect_column_type(cur, temp_table_name, col_name)
+                        column_types[col_name] = detected_type
+
+                    # Report detected types
+                    numeric_cols = {col: typ for col, typ in column_types.items() if typ != "TEXT"}
+                    if numeric_cols:
+                        rprint(
+                            f"  [green]Detected {len(numeric_cols)} numeric columns "
+                            f"({sum(1 for t in numeric_cols.values() if t == 'INTEGER')} INTEGER, "
+                            f"{sum(1 for t in numeric_cols.values() if t == 'DOUBLE PRECISION')} DOUBLE PRECISION)[/green]"
+                        )
+
+                    # Create final table with detected types (using sanitized names)
+                    final_columns_def = []
+                    for header in headers:
+                        col_name = column_mapping[header]
+                        # Skip coordinate columns if we're creating geometry
+                        if x_col and y_col and col_name in [x_col, y_col]:
+                            continue
+                        col_type = column_types.get(col_name, "TEXT")
+                        final_columns_def.append(f"{col_name} {col_type}")
+
+                    # Add geometry column if we have coordinates
+                    if x_col and y_col:
+                        final_columns_def.append(f"geom GEOMETRY(Point, {srid})")
+
+                    # Create the final table (we already checked if it exists above)
+                    create_final_sql = (
+                        f"CREATE TABLE {full_table_name} ({', '.join(final_columns_def)});"
+                    )
+                    cur.execute(create_final_sql)
+
+                    # Prepare column lists for INSERT INTO ... SELECT (using sanitized names)
+                    select_cols = []
+                    insert_cols = []
+
+                    for header in headers:
+                        col_name = column_mapping[header]
+                        # Skip coordinate columns if we're creating geometry
+                        if x_col and y_col and col_name in [x_col, y_col]:
+                            continue
+
+                        col_type = column_types.get(col_name, "TEXT")
+
+                        # Build the SELECT expression based on the target type
+                        if col_type == "INTEGER":
+                            # Convert TEXT to INTEGER, handling German decimal format and NULLs
+                            select_expr = f"NULLIF(REPLACE({col_name}, ',', '.'), '')::INTEGER"
+                        elif col_type == "DOUBLE PRECISION":
+                            # Convert TEXT to DOUBLE PRECISION, handling German decimal format and NULLs
+                            select_expr = (
+                                f"NULLIF(REPLACE({col_name}, ',', '.'), '')::DOUBLE PRECISION"
+                            )
+                        else:
+                            # Keep as TEXT
+                            select_expr = col_name
+
+                        select_cols.append(select_expr)
+                        insert_cols.append(col_name)
+
+                    # Add geometry transformation if we have coordinates
+                    if x_col and y_col:
+                        # Use ST_SetSRID and ST_MakePoint for geometry creation
+                        select_cols.append(
+                            f"ST_SetSRID(ST_MakePoint("
+                            f"NULLIF(REPLACE({x_col}, ',', '.'), '')::double precision, "
+                            f"NULLIF(REPLACE({y_col}, ',', '.'), '')::double precision"
+                            f"), {srid})"
+                        )
+                        insert_cols.append("geom")
+
+                    # Insert from temp to final table with geometry transformation
+                    insert_from_temp_sql = f"""
+                        INSERT INTO {full_table_name} ({", ".join(insert_cols)})
+                        SELECT {", ".join(select_cols)}
+                        FROM {temp_table_name}
+                    """
+                    cur.execute(insert_from_temp_sql)
+
+                    # Create spatial index if we have geometry
+                    if x_col and y_col:
+                        index_name = f"{table_name}_geom_idx"
+                        cur.execute(
+                            f"CREATE INDEX IF NOT EXISTS {index_name} "
+                            f"ON {full_table_name} USING GIST (geom);"
+                        )
+
+                    # Drop temporary table
+                    cur.execute(f"DROP TABLE {temp_table_name};")
+
+                    conn.commit()
+                    rprint(
+                        f"  [green]✓ Imported {rows_loaded:,} rows to {full_table_name}"
+                        f"{' (with geometry)' if x_col and y_col else ''}[/green]"
+                    )
+                    imported_count += 1
+
+            except Exception as e:
+                rprint(f"  [red]✗ Failed to import {csv_file.name}: {e!s}[/red]")
+                failed_count += 1
+                conn.rollback()
+                continue
+
             finally:
                 self.database_queue.task_done()
 
