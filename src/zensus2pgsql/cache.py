@@ -1,6 +1,7 @@
 """
 Functions for interacting with application cache
 """
+
 import os
 from pathlib import Path
 
