@@ -2,7 +2,7 @@
   <img src="./assets/zensus2pgsql-logo.svg" width="50%">
 </p>
 <p align="center">
-  <em>German census data, now in PostgreSQL!
+  <em>German census data, now in PostgreSQL!</em>
 </p>
 
 <p align="center">
