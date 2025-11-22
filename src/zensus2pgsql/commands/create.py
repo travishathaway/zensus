@@ -236,7 +236,13 @@ async def get_db_pool(db_config: DatabaseConfig) -> asyncpg.Pool:
 
 
 def collect(
-    tables: list[str] = typer.Argument(["all"]),
+    tables: list[str] = typer.Argument(
+        ["all"],
+        help=(
+            "Tables to download and import. When no tables are provided everything will be imported. "
+            "To see a full list, run `zensus2pgsql list`"
+        ),
+    ),
     host: str = typer.Option("localhost", "--host", "-h", help="PostgreSQL host"),
     port: int = typer.Option(5432, "--port", "-p", help="PostgreSQL port"),
     database: str = typer.Option("zensus", "--database", "--db", help="PostgreSQL database name"),
